@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { Buffer } from "buffer";
 
 dotenv.config({ path: '.env.local' });
 dotenv.config(); // also load .env if present
@@ -12,88 +11,247 @@ const PORT = Number(process.env.PORT) || 3001;
 app.use(cors());
 app.use(express.json());
 
-const EXPORT_CONFIG = {
-  ADMIN_EMAIL: 'devin@threepointshospitality.com',
-  ACCOUNT_ID: 'f9e05a9e-ccec-463e-beae-d1c5489f4c52',
-  PASSWORD: process.env.TRAINUAL_PASSWORD || '',
-  API_BASE: 'https://api.trainual.com/v1'
-};
+const API_BASE = 'https://api.trainual.com';
+const API_TOKEN = process.env.TRAINUAL_API_TOKEN || '';
 
-function buildAuthHeader() {
-  const username = `${EXPORT_CONFIG.ADMIN_EMAIL}&${EXPORT_CONFIG.ACCOUNT_ID}`;
-  return `Basic ${Buffer.from(`${username}:${EXPORT_CONFIG.PASSWORD}`).toString('base64')}`;
+function authHeaders() {
+  return {
+    'Authorization': `Bearer ${API_TOKEN}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
 }
 
-async function trainualFetch(endpoint: string, method: string = 'GET', payload?: any) {
-  const url = `${EXPORT_CONFIG.API_BASE}${endpoint}`;
-  const options: RequestInit = {
-    method,
-    headers: {
-      'Authorization': buildAuthHeader(),
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    }
-  };
-  if (payload) options.body = JSON.stringify(payload);
+class TrainualApiError extends Error {
+  status: number;
+  body: any;
+  constructor(status: number, body: any) {
+    super(`Trainual API error ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// No Retry-After header on v3 — exponential backoff on 429 and 5xx.
+function backoffMs(attempt: number) {
+  return Math.min(1000 * Math.pow(2, attempt), 16000);
+}
+
+async function safeJson(response: Response) {
+  const text = await response.text().catch(() => '');
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text.slice(0, 500) };
+  }
+}
+
+// `path` may be a full URL (e.g. a JSON:API `links.next` page) or a /v3/... path.
+async function trainualFetch(path: string, method: string = 'GET', payload?: any): Promise<any> {
+  const url = path.startsWith('http') ? path : `${API_BASE}${path}`;
+  const options: RequestInit = { method, headers: authHeaders() };
+  if (payload !== undefined) options.body = JSON.stringify(payload);
+
+  const maxAttempts = 5;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let response: Response;
     try {
-      const response = await fetch(url, options);
-      if (response.status === 200 || response.status === 201) {
-        const text = await response.text();
-        return text ? JSON.parse(text) : {};
-      }
-      if (response.status === 204) return {};
-      if (response.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt + 1) * 1000));
-        continue;
-      }
-      console.error(`Trainual API Error: ${response.status} ${response.statusText} for ${url}`);
-      const errBody = await response.text().catch(() => '');
-      console.error(`Response body: ${errBody.slice(0, 500)}`);
-      return null;
+      response = await fetch(url, options);
     } catch (e) {
-      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+      if (attempt === maxAttempts - 1) throw new TrainualApiError(502, { error: 'Network error contacting Trainual' });
+      await sleep(backoffMs(attempt));
+      continue;
     }
+
+    if (response.status === 429 || response.status >= 500) {
+      if (attempt === maxAttempts - 1) throw new TrainualApiError(response.status, await safeJson(response));
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+
+    if (response.status === 204) return null;
+    if (response.ok) {
+      const text = await response.text();
+      return text ? JSON.parse(text) : null;
+    }
+
+    throw new TrainualApiError(response.status, await safeJson(response));
   }
   return null;
+}
+
+// Follows JSON:API `links.next` (max page[size] is 100) to collect every page.
+async function fetchAllPages(path: string): Promise<any[]> {
+  let url: string | undefined = path;
+  let results: any[] = [];
+  let guard = 0;
+  while (url && guard < 200) {
+    const data: any = await trainualFetch(url);
+    if (!data) break;
+    results = results.concat(data.data || []);
+    url = data.links?.next;
+    guard++;
+  }
+  return results;
+}
+
+function handleTrainualError(res: express.Response, e: any) {
+  if (e instanceof TrainualApiError) {
+    console.error(`Trainual API error ${e.status}:`, JSON.stringify(e.body).slice(0, 500));
+    res.status(e.status).json(e.body ?? { error: 'Trainual API error' });
+    return;
+  }
+  console.error('Trainual proxy error:', e);
+  res.status(502).json({ error: 'Trainual proxy error' });
 }
 
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({
     status: 'ok',
-    passwordConfigured: !!EXPORT_CONFIG.PASSWORD,
-    passwordLength: EXPORT_CONFIG.PASSWORD.length
+    tokenConfigured: !!API_TOKEN
   });
 });
 
 // API Routes
 app.get("/api/trainual/users", async (req, res) => {
-  const data = await trainualFetch('/users?curriculums_assigned=true&roles_assigned=true');
-  res.json(data || []);
+  try {
+    const [usersRes, assignments, responsibilitiesRes] = await Promise.all([
+      trainualFetch('/v3/users'),
+      fetchAllPages('/v3/assignments?content_type=subject&page[size]=100'),
+      trainualFetch('/v3/responsibilities?include=users')
+    ]);
+
+    const subjectsByUser = new Map<string, Set<string>>();
+    for (const a of assignments) {
+      const userId = a?.relationships?.user?.data?.id;
+      const subjectId = a?.relationships?.subject?.data?.id;
+      if (!userId || !subjectId) continue;
+      if (!subjectsByUser.has(userId)) subjectsByUser.set(userId, new Set());
+      subjectsByUser.get(userId)!.add(subjectId);
+    }
+
+    const rolesByUser = new Map<string, string[]>();
+    for (const r of (responsibilitiesRes?.data || [])) {
+      const name = r?.attributes?.name;
+      const userRefs = r?.relationships?.users?.data || [];
+      for (const u of userRefs) {
+        const uid = u?.id;
+        if (!uid || !name) continue;
+        if (!rolesByUser.has(uid)) rolesByUser.set(uid, []);
+        rolesByUser.get(uid)!.push(name);
+      }
+    }
+
+    const users = (usersRes?.data || []).map((u: any) => ({
+      id: Number(u.id),
+      name: u.attributes?.name || '',
+      email: u.attributes?.email || '',
+      status: u.attributes?.status || '',
+      curriculums_assigned: Array.from(subjectsByUser.get(u.id) || []).map(id => ({ id: Number(id) })),
+      roles_assigned: (rolesByUser.get(u.id) || []).map(name => ({ name }))
+    }));
+
+    res.json(users);
+  } catch (e) {
+    handleTrainualError(res, e);
+  }
 });
 
 app.get("/api/trainual/subjects", async (req, res) => {
-  const data = await trainualFetch('/curriculums?assigned_users=true');
-  res.json(data || []);
+  try {
+    const [subjectsRes, testsRes] = await Promise.all([
+      trainualFetch('/v3/subjects'),
+      trainualFetch('/v3/content?filter[type]=tests')
+    ]);
+
+    const testCountBySubject = new Map<string, number>();
+    for (const t of (testsRes?.data || [])) {
+      const subjectId = t?.attributes?.subject_id;
+      if (subjectId == null) continue;
+      const key = String(subjectId);
+      testCountBySubject.set(key, (testCountBySubject.get(key) || 0) + 1);
+    }
+
+    const subjects = (subjectsRes?.data || []).map((s: any) => ({
+      id: Number(s.id),
+      title: s.attributes?.title || 'Untitled',
+      surveys_count: testCountBySubject.get(s.id) || 0
+    }));
+
+    res.json(subjects);
+  } catch (e) {
+    handleTrainualError(res, e);
+  }
 });
 
 app.get("/api/trainual/subjects/:id/tests", async (req, res) => {
-  const data = await trainualFetch(`/curriculums/${req.params.id}/surveys`);
-  res.json(data || []);
+  try {
+    const testsRes = await trainualFetch('/v3/content?filter[type]=tests');
+    const subjectId = req.params.id;
+    const tests = (testsRes?.data || [])
+      .filter((t: any) => String(t?.attributes?.subject_id) === String(subjectId))
+      .map((t: any) => ({ id: Number(t.id), name: t.attributes?.title || 'Unnamed Test' }));
+    res.json(tests);
+  } catch (e) {
+    handleTrainualError(res, e);
+  }
 });
 
 app.put("/api/trainual/users/:id/assign", async (req, res) => {
-  const { curriculum_ids } = req.body;
-  const data = await trainualFetch(`/users/${req.params.id}/assign_curriculums`, 'PUT', { curriculum_ids });
-  res.json(data || { success: false });
+  const userId = Number(req.params.id);
+  const curriculumIds: number[] = req.body?.curriculum_ids || [];
+  try {
+    const results = await Promise.all(curriculumIds.map(async (subjectId) => {
+      try {
+        await trainualFetch('/v3/assignments', 'POST', {
+          data: { type: 'assignments', attributes: { user_id: userId, subject_id: subjectId } }
+        });
+        return true;
+      } catch (e: any) {
+        console.error(`Failed to assign subject ${subjectId} to user ${userId}:`, e?.status, e?.body && JSON.stringify(e.body).slice(0, 300));
+        return false;
+      }
+    }));
+    res.json({
+      success: results.every(Boolean),
+      assigned: results.filter(Boolean).length,
+      failed: results.filter(r => !r).length
+    });
+  } catch (e) {
+    handleTrainualError(res, e);
+  }
 });
 
 app.put("/api/trainual/users/:id/unassign", async (req, res) => {
-  const { curriculum_ids } = req.body;
-  const data = await trainualFetch(`/users/${req.params.id}/unassign_curriculums`, 'PUT', { curriculum_ids });
-  res.json(data || { success: false });
+  const userId = Number(req.params.id);
+  const curriculumIds: number[] = req.body?.curriculum_ids || [];
+  try {
+    const results = await Promise.all(curriculumIds.map(async (subjectId) => {
+      try {
+        const existing = await trainualFetch(`/v3/assignments?user_id=${userId}&content_type=subject&content_id=${subjectId}`);
+        const assignment = (existing?.data || [])[0];
+        if (!assignment) return false;
+        await trainualFetch(`/v3/assignments/${assignment.id}`, 'DELETE');
+        return true;
+      } catch (e: any) {
+        console.error(`Failed to unassign subject ${subjectId} from user ${userId}:`, e?.status, e?.body && JSON.stringify(e.body).slice(0, 300));
+        return false;
+      }
+    }));
+    res.json({
+      success: results.every(Boolean),
+      unassigned: results.filter(Boolean).length,
+      failed: results.filter(r => !r).length
+    });
+  } catch (e) {
+    handleTrainualError(res, e);
+  }
 });
 
 app.listen(PORT, "0.0.0.0", () => {

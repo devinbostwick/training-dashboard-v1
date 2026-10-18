@@ -5,7 +5,7 @@ services:
     buildCommand: npm install && npx tsc --version
     startCommand: npx tsx server.ts
     envVars:
-      - key: TRAINUAL_PASSWORD
+      - key: TRAINUAL_API_TOKEN
         sync: false
       - key: NODE_ENV
         value: production
