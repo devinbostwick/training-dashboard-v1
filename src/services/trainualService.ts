@@ -59,6 +59,58 @@ async function trainualFetch(endpoint: string, method: string = 'GET', payload?:
   return null;
 }
 
+export interface BulkWriteResult {
+  success: boolean;
+  succeeded: number[];
+  failed: number[];
+  error?: string;
+}
+
+// Assign/unassign are writes against the proxy's own bulk endpoints, which report
+// per-item success/failure. Retry only on 429 — a 5xx or 502 (partial failure) must
+// not be blindly retried since some items may have already succeeded upstream.
+async function trainualWrite(endpoint: string, payload: any, allIds: number[]): Promise<BulkWriteResult> {
+  const url = `${getProxyBase()}${endpoint}`;
+  const options: RequestInit = {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(url, options);
+    } catch (e: any) {
+      if (attempt === 2) return { success: false, succeeded: [], failed: allIds, error: e?.message || 'Network error' };
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+      continue;
+    }
+
+    if (response.status === 429) {
+      if (attempt === 2) return { success: false, succeeded: [], failed: allIds, error: 'Rate limited, please retry' };
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt + 1) * 1000));
+      continue;
+    }
+
+    const text = await response.text().catch(() => '');
+    let body: any = {};
+    try { body = text ? JSON.parse(text) : {}; } catch { body = {}; }
+
+    if (response.ok) {
+      return { success: true, succeeded: body.succeeded ?? allIds, failed: body.failed ?? [] };
+    }
+    // Non-429 failure: don't retry, surface whatever succeeded/failed the proxy reported.
+    return {
+      success: false,
+      succeeded: body.succeeded ?? [],
+      failed: body.failed ?? allIds,
+      error: body.error || `Trainual API Error: ${response.status}`
+    };
+  }
+  return { success: false, succeeded: [], failed: allIds, error: 'Rate limited, please retry' };
+}
+
 export async function fetchUsers() {
   return await trainualFetch('/users') || [];
 }
@@ -71,12 +123,18 @@ export async function fetchSubjectTests(subjectId: number) {
   return await trainualFetch(`/subjects/${subjectId}/tests`) || [];
 }
 
-export async function assignCurriculums(userId: number, curriculumIds: number[]) {
-  return await trainualFetch(`/users/${userId}/assign`, 'PUT', { curriculum_ids: curriculumIds });
+// Every test with its subject_id, fetched once and grouped client-side — avoids
+// issuing one request per subject.
+export async function fetchAllTests(): Promise<{ id: number; name: string; subject_id: number | null }[]> {
+  return await trainualFetch('/tests') || [];
 }
 
-export async function unassignCurriculums(userId: number, curriculumIds: number[]) {
-  return await trainualFetch(`/users/${userId}/unassign`, 'PUT', { curriculum_ids: curriculumIds });
+export async function assignCurriculums(userId: number, curriculumIds: number[]): Promise<BulkWriteResult> {
+  return trainualWrite(`/users/${userId}/assign`, { curriculum_ids: curriculumIds }, curriculumIds);
+}
+
+export async function unassignCurriculums(userId: number, curriculumIds: number[]): Promise<BulkWriteResult> {
+  return trainualWrite(`/users/${userId}/unassign`, { curriculum_ids: curriculumIds }, curriculumIds);
 }
 
 export function isTrainualConfigured(): boolean {

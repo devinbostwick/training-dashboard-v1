@@ -1,7 +1,22 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Users, BookOpen, RefreshCw, FilterX, Search, ChevronDown, ChevronRight, CheckSquare, Square, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { fetchUsers, fetchSubjects, fetchSubjectTests, assignCurriculums, unassignCurriculums, isTrainualConfigured } from '../services/trainualService';
+import { fetchUsers, fetchSubjects, fetchAllTests, assignCurriculums, unassignCurriculums, isTrainualConfigured } from '../services/trainualService';
+
+const UPSTREAM_CONCURRENCY = 5;
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 interface User {
   id: number;
@@ -53,21 +68,29 @@ export default function TestAssigner() {
     }
     setLoading(true);
     try {
-      const [usersData, subjectsData] = await Promise.all([
+      const [usersData, subjectsData, allTests] = await Promise.all([
         fetchUsers(),
-        fetchSubjects()
+        fetchSubjects(),
+        fetchAllTests()
       ]);
+
+      // Fetched once above and grouped here, instead of once per subject.
+      const testsBySubject = new Map<number, { id: number; name: string }[]>();
+      for (const t of allTests) {
+        if (t.subject_id == null) continue;
+        if (!testsBySubject.has(t.subject_id)) testsBySubject.set(t.subject_id, []);
+        testsBySubject.get(t.subject_id)!.push({ id: t.id, name: t.name || 'Unnamed Test' });
+      }
 
       // Process subjects
       const testSubjects: Subject[] = [];
       for (const s of subjectsData) {
         if ((s.surveys_count || 0) > 0) {
-          const testsData = await fetchSubjectTests(s.id);
           testSubjects.push({
             id: s.id,
             title: s.title || 'Untitled',
             testCount: s.surveys_count || 0,
-            tests: Array.isArray(testsData) ? testsData.map((t: any) => ({ id: t.id, name: t.name || 'Unnamed Test' })) : []
+            tests: testsBySubject.get(s.id) || []
           });
         }
       }
@@ -190,47 +213,43 @@ export default function TestAssigner() {
   };
 
   const assignToUser = async (userId: number, subjectIds: number[]) => {
-    try {
-      const result = await assignCurriculums(userId, subjectIds);
-      if (result !== null) {
-        setUsers(prev => prev.map(u => {
-          if (u.id === userId) {
-            const newAssigned = { ...u.assignedSubjectIds };
-            subjectIds.forEach(id => newAssigned[id] = true);
-            return { ...u, assignedSubjectIds: newAssigned };
-          }
-          return u;
-        }));
-        showToast(`Assigned ${subjectIds.length} subject(s)`, 'success');
-        return true;
-      }
-      throw new Error('Failed to assign');
-    } catch (e: any) {
-      showToast(e.message, 'error');
-      return false;
+    const result = await assignCurriculums(userId, subjectIds);
+    if (result.succeeded.length > 0) {
+      setUsers(prev => prev.map(u => {
+        if (u.id === userId) {
+          const newAssigned = { ...u.assignedSubjectIds };
+          result.succeeded.forEach(id => newAssigned[id] = true);
+          return { ...u, assignedSubjectIds: newAssigned };
+        }
+        return u;
+      }));
     }
+    if (result.failed.length > 0) {
+      showToast(result.error || `Failed to assign ${result.failed.length} subject(s)`, 'error');
+    } else if (result.succeeded.length > 0) {
+      showToast(`Assigned ${result.succeeded.length} subject(s)`, 'success');
+    }
+    return result.success;
   };
 
   const unassignFromUser = async (userId: number, subjectIds: number[]) => {
-    try {
-      const result = await unassignCurriculums(userId, subjectIds);
-      if (result !== null) {
-        setUsers(prev => prev.map(u => {
-          if (u.id === userId) {
-            const newAssigned = { ...u.assignedSubjectIds };
-            subjectIds.forEach(id => delete newAssigned[id]);
-            return { ...u, assignedSubjectIds: newAssigned };
-          }
-          return u;
-        }));
-        showToast(`Unassigned ${subjectIds.length} subject(s)`, 'success');
-        return true;
-      }
-      throw new Error('Failed to unassign');
-    } catch (e: any) {
-      showToast(e.message, 'error');
-      return false;
+    const result = await unassignCurriculums(userId, subjectIds);
+    if (result.succeeded.length > 0) {
+      setUsers(prev => prev.map(u => {
+        if (u.id === userId) {
+          const newAssigned = { ...u.assignedSubjectIds };
+          result.succeeded.forEach(id => delete newAssigned[id]);
+          return { ...u, assignedSubjectIds: newAssigned };
+        }
+        return u;
+      }));
     }
+    if (result.failed.length > 0) {
+      showToast(result.error || `Failed to unassign ${result.failed.length} subject(s)`, 'error');
+    } else if (result.succeeded.length > 0) {
+      showToast(`Unassigned ${result.succeeded.length} subject(s)`, 'success');
+    }
+    return result.success;
   };
 
   const getInitials = (name: string) => {
@@ -627,7 +646,7 @@ export default function TestAssigner() {
                               onClick={() => {
                                 const unassigned = users.filter(u => !u.assignedSubjectIds[subject.id]).map(u => u.id);
                                 if (unassigned.length && confirm(`Assign this subject to all ${unassigned.length} unassigned employees?`)) {
-                                  Promise.all(unassigned.map(uid => assignToUser(uid, [subject.id])));
+                                  mapWithConcurrency(unassigned, UPSTREAM_CONCURRENCY, uid => assignToUser(uid, [subject.id]));
                                 }
                               }}
                               className="px-4 py-2 bg-primary/10 text-primary border border-primary/20 rounded-lg text-sm font-medium hover:bg-primary/20 transition-colors"
