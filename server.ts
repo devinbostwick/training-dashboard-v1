@@ -68,7 +68,8 @@ async function trainualFetch(path: string, method: string = 'GET', payload?: any
     try {
       response = await fetch(url, options);
     } catch (e) {
-      if (attempt === maxAttempts - 1) throw new TrainualApiError(502, { error: 'Network error contacting Trainual' });
+      // A write may have landed before the connection dropped: never replay it.
+      if (isWrite || attempt === maxAttempts - 1) throw new TrainualApiError(502, { error: 'Network error contacting Trainual' });
       await sleep(backoffMs(attempt));
       continue;
     }
@@ -105,7 +106,8 @@ async function fetchAllPages(path: string): Promise<any[]> {
     const next = data.links?.next;
     if (next) {
       try {
-        if (new URL(next).host === API_HOST) {
+        const nextUrl = new URL(next);
+        if (nextUrl.protocol === 'https:' && nextUrl.host === API_HOST) {
           url = next;
         } else {
           console.error(`Ignoring links.next with unexpected host: ${next}`);
@@ -290,7 +292,7 @@ app.put("/api/trainual/users/:id/assign", async (req, res) => {
     res.status(400).json({ error: 'userId must be a positive integer' });
     return;
   }
-  if (!curriculumIds.every(isPositiveInteger)) {
+  if (!Array.isArray(curriculumIds) || !curriculumIds.every(isPositiveInteger)) {
     res.status(400).json({ error: 'curriculum_ids must all be positive integers' });
     return;
   }
@@ -325,7 +327,7 @@ app.put("/api/trainual/users/:id/unassign", async (req, res) => {
     res.status(400).json({ error: 'userId must be a positive integer' });
     return;
   }
-  if (!curriculumIds.every(isPositiveInteger)) {
+  if (!Array.isArray(curriculumIds) || !curriculumIds.every(isPositiveInteger)) {
     res.status(400).json({ error: 'curriculum_ids must all be positive integers' });
     return;
   }
