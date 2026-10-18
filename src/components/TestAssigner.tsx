@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import {
-  fetchUsers, fetchSubjects, fetchSubjectTests,
+  fetchUsers, fetchSubjects, fetchAllTests,
   assignCurriculums, unassignCurriculums, isTrainualConfigured
 } from '../services/trainualService';
 
@@ -155,19 +155,26 @@ export default function TestAssigner({ mode = 'assign' }: { mode?: 'directory' |
     }
     setLoading(true);
     try {
-      const [usersData, subjectsData] = await Promise.all([fetchUsers(), fetchSubjects()]);
+      const [usersData, subjectsData, allTests] = await Promise.all([fetchUsers(), fetchSubjects(), fetchAllTests()]);
+
+      // Fetched once above and grouped here, instead of once per subject.
+      const testsBySubject = new Map<number, { id: number; name: string }[]>();
+      for (const t of allTests) {
+        if (t.subject_id == null) continue;
+        if (!testsBySubject.has(t.subject_id)) testsBySubject.set(t.subject_id, []);
+        testsBySubject.get(t.subject_id)!.push({ id: t.id, name: t.name || 'Unnamed Test' });
+      }
 
       const testSubjects: Subject[] = [];
       for (const s of subjectsData) {
         if ((s.surveys_count || 0) > 0) {
-          const testsData = await fetchSubjectTests(s.id);
           const title = s.title || 'Untitled';
           const { category, location, role } = detectCategory(title);
           testSubjects.push({
             id: s.id,
             title,
             testCount: s.surveys_count || 0,
-            tests: Array.isArray(testsData) ? testsData.map((t: any) => ({ id: t.id, name: t.name || 'Unnamed Test' })) : [],
+            tests: testsBySubject.get(s.id) || [],
             category,
             location,
             role,
@@ -240,7 +247,7 @@ export default function TestAssigner({ mode = 'assign' }: { mode?: 'directory' |
   const toggle = async (userId: number, subjectId: number, isAssigned: boolean) => {
     if (isAssigned) {
       const result = await unassignCurriculums(userId, [subjectId]);
-      if (result !== null) {
+      if (result.succeeded.includes(subjectId)) {
         setUsers(prev => prev.map(u => {
           if (u.id !== userId) return u;
           const n = { ...u.assignedSubjectIds };
@@ -248,16 +255,20 @@ export default function TestAssigner({ mode = 'assign' }: { mode?: 'directory' |
           return { ...u, assignedSubjectIds: n };
         }));
         showToast('Subject unassigned', 'info');
-      } else showToast('Failed to unassign', 'error');
+      } else {
+        showToast(result.error || 'Failed to unassign', 'error');
+      }
     } else {
       const result = await assignCurriculums(userId, [subjectId]);
-      if (result !== null) {
+      if (result.succeeded.includes(subjectId)) {
         setUsers(prev => prev.map(u => {
           if (u.id !== userId) return u;
           return { ...u, assignedSubjectIds: { ...u.assignedSubjectIds, [subjectId]: true } };
         }));
         showToast('Subject assigned ✓', 'success');
-      } else showToast('Failed to assign', 'error');
+      } else {
+        showToast(result.error || 'Failed to assign', 'error');
+      }
     }
   };
 
